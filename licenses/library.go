@@ -22,7 +22,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/google/go-licenses/internal/third_party/pkgsite/source"
+	"github.com/pulumi/go-licenses/internal/third_party/pkgsite/source"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/tools/go/packages"
 	"k8s.io/klog/v2"
@@ -375,7 +375,7 @@ func (l *Library) FileURL(ctx context.Context, cl *source.Client, filePath strin
 		// This always happens for the module in development.
 		// Note#1 if we pass version=HEAD to source.ModuleInfo, github tag for modules not at the root
 		// of the repo will be incorrect, because there's a convention that:
-		// * I have a module at github.com/google/go-licenses/submod.
+		// * I have a module at github.com/pulumi/go-licenses/submod.
 		// * The module is of version v1.0.0.
 		// Then the github tag should be submod/v1.0.0.
 		// In our case, if we pass HEAD as version, the result commit will be submod/HEAD which is incorrect.
@@ -386,9 +386,9 @@ func (l *Library) FileURL(ctx context.Context, cl *source.Client, filePath strin
 		// always refers to the default branch, so it's better than
 		// both of master/main when we do not know which branch is default.
 		// Examples:
-		// * https://github.com/google/go-licenses/blob/HEAD/LICENSE
+		// * https://github.com/pulumi/go-licenses/blob/HEAD/LICENSE
 		// points to latest commit of master branch.
-		// * https://github.com/google/licenseclassifier/blob/HEAD/LICENSE
+		// * https://github.com/pulumi/licenseclassifier/blob/HEAD/LICENSE
 		// points to latest commit of main branch.
 		remote.SetCommit("HEAD")
 		klog.Warningf("module %s has empty version, defaults to HEAD. The license URL may be incorrect. Please verify!", m.Path)
