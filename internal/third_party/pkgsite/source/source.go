@@ -22,20 +22,20 @@ package source
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"log" // We cannot use glog instead, because its "v" flag conflicts with other libraries we use.
+	"log" // We cannot use glog instead, because its "v" flag conflicts with other libraries we use
 	"net/http"
 	"path"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/pulumi/go-licenses/internal/third_party/pkgsite/derrors"
 	"github.com/pulumi/go-licenses/internal/third_party/pkgsite/stdlib"
+	"github.com/pulumi/go-licenses/internal/third_party/pkgsite/trace"
 	"github.com/pulumi/go-licenses/internal/third_party/pkgsite/version"
-	"go.opencensus.io/plugin/ochttp"
-	"go.opencensus.io/trace"
 	"golang.org/x/net/context/ctxhttp"
 )
 
@@ -46,6 +46,38 @@ type Info struct {
 	moduleDir string       // directory of module relative to repo root
 	commit    string       // tag or ID of commit corresponding to version
 	templates urlTemplates // for building URLs
+}
+
+// RepoURL returns a URL for the home page of the repository.
+func (i *Info) RepoURL() string {
+	if i == nil {
+		return ""
+	}
+	if i.templates.Repo == "" {
+		// The default repo template is just "{repo}".
+		return i.repoURL
+	}
+	return expand(i.templates.Repo, map[string]string{
+		"repo": i.repoURL,
+	})
+}
+
+// ModuleURL returns a URL for the home page of the module.
+func (i *Info) ModuleURL() string {
+	return i.DirectoryURL("")
+}
+
+// DirectoryURL returns a URL for a directory relative to the module's home directory.
+func (i *Info) DirectoryURL(dir string) string {
+	if i == nil {
+		return ""
+	}
+	return strings.TrimSuffix(expand(i.templates.Directory, map[string]string{
+		"repo":       i.repoURL,
+		"importPath": path.Join(strings.TrimPrefix(i.repoURL, "https://"), dir),
+		"commit":     i.commit,
+		"dir":        path.Join(i.moduleDir, dir),
+	}), "/")
 }
 
 // FileURL returns a URL for a file whose pathname is relative to the module's home directory.
@@ -64,20 +96,117 @@ func (i *Info) FileURL(pathname string) string {
 	})
 }
 
+// LineURL returns a URL referring to a line in a file relative to the module's home directory.
+func (i *Info) LineURL(pathname string, line int) string {
+	if i == nil {
+		return ""
+	}
+	dir, base := path.Split(pathname)
+	return expand(i.templates.Line, map[string]string{
+		"repo":       i.repoURL,
+		"importPath": path.Join(strings.TrimPrefix(i.repoURL, "https://"), dir),
+		"commit":     i.commit,
+		"file":       path.Join(i.moduleDir, pathname),
+		"dir":        dir,
+		"base":       base,
+		"line":       strconv.Itoa(line),
+	})
+}
+
+// RawURL returns a URL referring to the raw contents of a file relative to the
+// module's home directory.
+func (i *Info) RawURL(pathname string) string {
+	if i == nil {
+		return ""
+	}
+	// Some templates don't support raw content serving.
+	if i.templates.Raw == "" {
+		return ""
+	}
+	moduleDir := i.moduleDir
+	// Special case: the standard library's source module path is set to "src",
+	// which is correct for source file links. But the README is at the repo
+	// root, not in the src directory. In other words,
+	// Module.Units[0].Readme.FilePath is not relative to
+	// Module.Units[0].SourceInfo.moduleDir, as it is for every other module.
+	// Correct for that here.
+	if i.repoURL == stdlib.GoSourceRepoURL {
+		moduleDir = ""
+	}
+	return expand(i.templates.Raw, map[string]string{
+		"repo":   i.repoURL,
+		"commit": i.commit,
+		"file":   path.Join(moduleDir, pathname),
+	})
+}
+
+// map of common urlTemplates
+var urlTemplatesByKind = map[string]urlTemplates{
+	"github":    githubURLTemplates,
+	"gitlab":    gitlabURLTemplates,
+	"bitbucket": bitbucketURLTemplates,
+}
+
+// jsonInfo is a Go struct describing the JSON structure of an INFO.
+type jsonInfo struct {
+	RepoURL   string
+	ModuleDir string
+	Commit    string
+	// Store common templates efficiently by setting this to a short string
+	// we look up in a map. If Kind != "", then Templates == nil.
+	Kind      string        `json:",omitempty"`
+	Templates *urlTemplates `json:",omitempty"`
+}
+
+// MarshalJSON returns the Info encoded for storage in the database.
+func (i *Info) MarshalJSON() (_ []byte, err error) {
+	defer derrors.Wrap(&err, "MarshalJSON")
+
+	ji := &jsonInfo{
+		RepoURL:   i.repoURL,
+		ModuleDir: i.moduleDir,
+		Commit:    i.commit,
+	}
+	// Store common templates efficiently, by name.
+	for kind, templs := range urlTemplatesByKind {
+		if i.templates == templs {
+			ji.Kind = kind
+			break
+		}
+	}
+	if ji.Kind == "" && i.templates != (urlTemplates{}) {
+		ji.Templates = &i.templates
+	}
+	return json.Marshal(ji)
+}
+
+func (i *Info) UnmarshalJSON(data []byte) (err error) {
+	defer derrors.Wrap(&err, "UnmarshalJSON(data)")
+
+	var ji jsonInfo
+	if err := json.Unmarshal(data, &ji); err != nil {
+		return err
+	}
+	i.repoURL = trimVCSSuffix(ji.RepoURL)
+	i.moduleDir = ji.ModuleDir
+	i.commit = ji.Commit
+	if ji.Kind != "" {
+		i.templates = urlTemplatesByKind[ji.Kind]
+	} else if ji.Templates != nil {
+		i.templates = *ji.Templates
+	}
+	return nil
+}
+
 type Client struct {
 	// client used for HTTP requests. It is mutable for testing purposes.
 	// If nil, then moduleInfoDynamic will return nil, nil; also for testing.
 	httpClient *http.Client
 }
 
-// New constructs a *Client using the provided timeout.
-func NewClient(timeout time.Duration) *Client {
-	return &Client{
-		httpClient: &http.Client{
-			Transport: &ochttp.Transport{},
-			Timeout:   timeout,
-		},
-	}
+// New constructs a *Client using the provided *http.Client.
+func NewClient(httpClient *http.Client) *Client {
+	return &Client{httpClient: httpClient}
 }
 
 // NewClientForTesting returns a Client suitable for testing. It returns the
@@ -128,10 +257,6 @@ func ModuleInfo(ctx context.Context, client *Client, modulePath, v string) (info
 		return NewGitHubInfo("https://"+modulePath, "", v), nil
 	}
 
-	if modulePath == stdlib.ModulePath {
-		return newStdlibInfo(v)
-	}
-
 	repo, relativeModulePath, templates, transformCommit, err := matchStatic(modulePath)
 	if err != nil {
 		info, err = moduleInfoDynamic(ctx, client, modulePath, v)
@@ -161,8 +286,8 @@ func ModuleInfo(ctx context.Context, client *Client, modulePath, v string) (info
 	// in cmd/go/internal/get/vcs.go.
 }
 
-func newStdlibInfo(version string) (_ *Info, err error) {
-	defer derrors.Wrap(&err, "newStdlibInfo(%q)", version)
+func NewStdlibInfo(version string) (_ *Info, err error) {
+	defer derrors.Wrap(&err, "NewStdlibInfo(%q)", version)
 
 	commit, err := stdlib.TagForVersion(version)
 	if err != nil {
@@ -781,5 +906,34 @@ func NewGitHubInfo(repoURL, moduleDir, commit string) *Info {
 		moduleDir: moduleDir,
 		commit:    commit,
 		templates: githubURLTemplates,
+	}
+}
+
+// NewStdlibInfoForTest returns a source.Info for the standard library at the given
+// semantic version. It panics if the version does not correspond to a Go release
+// tag. It is for testing only.
+func NewStdlibInfoForTest(version string) *Info {
+	info, err := NewStdlibInfo(version)
+	if err != nil {
+		panic(err)
+	}
+	return info
+}
+
+// FilesInfo returns an Info that links to a path in the server's /files
+// namespace. The same path needs to be installed via frontend.Server.InstallFS.
+func FilesInfo(dir string) *Info {
+	// The repo and directory patterns need a final slash. Without it,
+	// http.FileServer redirects instead of serving the directory contents, with
+	// confusing results.
+	return &Info{
+		repoURL: path.Join("/files", filepath.ToSlash(dir)),
+		templates: urlTemplates{
+			Repo:      "{repo}/",
+			Directory: "{repo}/{dir}/",
+			File:      "{repo}/{file}",
+			Line:      "{repo}/{file}#L{line}", // not supported now, but maybe someday
+			Raw:       "{repo}/{file}",
+		},
 	}
 }
